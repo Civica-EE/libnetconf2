@@ -75,6 +75,7 @@ set(LIBNETCONF2_SOVERSION ${LIBNETCONF2_MAJOR_SOVERSION})
 set(LIBYANG_DEP_SOVERSION_MAJOR 2)
 
 set(CMAKE_C_FLAGS           "${CMAKE_C_FLAGS} -Wall -Wextra -fvisibility=hidden -std=gnu99")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D__RILE__='\"$(firstword $(filter-out %.ts,$^))\"'")
 
 #
 # options
@@ -90,6 +91,7 @@ option(ENABLE_COVERAGE "Build code coverage report from tests" OFF)
 option(ENABLE_SSH "Enable NETCONF over SSH support (via libssh)" ON)
 option(ENABLE_TLS "Enable NETCONF over TLS support (via OpenSSL)" ON)
 option(ENABLE_DNSSEC "Enable support for SSHFP retrieval using DNSSEC for SSH (requires OpenSSL and libval)" OFF)
+option(ENABLE_RESTCONF "Enable RESTCONF support (via libfcgi)" OFF)
 set(READ_INACTIVE_TIMEOUT 20 CACHE STRING "Maximum number of seconds waiting for new data once some data have arrived")
 set(READ_ACTIVE_TIMEOUT 300 CACHE STRING "Maximum number of seconds for receiving a full message")
 set(MAX_PSPOLL_THREAD_COUNT 6 CACHE STRING "Maximum number of threads that could simultaneously access a ps_poll structure")
@@ -121,6 +123,13 @@ if(ENABLE_TLS)
         src/session_server_tls.c)
     set(TLS_MACRO "#ifndef NC_ENABLED_TLS\n#define NC_ENABLED_TLS\n#endif")
 endif()
+
+if(ENABLE_RESTCONF)
+  list(APPEND libsrc
+        src/session_server_fcgi.c)
+   set(FCGI_MACRO "#ifndef NC_ENABLED_FCGI\n#define NC_ENABLED_FCGI\n#endif")
+endif()
+
 
 set(headers
     src/log.h
@@ -261,6 +270,17 @@ if(ENABLE_DNSSEC)
     target_link_libraries(netconf2 ${LIBVAL_LIBRARIES})
     include_directories(${LIBVAL_INCLUDE_DIRS})
 endif()
+
+# Restconf is enabled - global build switches
+if(ENABLE_RESTCONF)
+    find_package(LibFCGI REQUIRED)
+    include_directories(${LIBFCGI_INCLUDE_DIRS})
+    list(APPEND CMAKE_REQUIRED_INCLUDES ${LIBFCGI_INCLUDE_DIRS})
+    list(APPEND CMAKE_REQUIRED_LIBRARIES ${LIBFCGI_LIBRARIES})
+    target_link_libraries(netconf2 ${LIBFCGI_LIBRARIES})
+    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DNC_ENABLED_FCGI")
+endif()
+
 
 # dependencies - libyang
 find_package(LibYANG ${LIBYANG_DEP_SOVERSION_MAJOR} REQUIRED)

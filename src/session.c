@@ -877,6 +877,12 @@ nc_session_free(struct nc_session *session, void (*data_free)(void *))
         }
         break;
 #endif
+
+#ifdef NC_ENABLED_FCGI
+    case NC_TI_FCGI:
+        break;
+#endif
+        
     case NC_TI_NONE:
         break;
     }
@@ -1679,6 +1685,10 @@ nc_init(void)
 #elif defined (NC_ENABLED_TLS)
     nc_tls_init();
 #endif
+
+#ifdef NC_ENABLED_FCGI
+    (void) nc_fcgi_init();
+#endif
 }
 
 void
@@ -1690,5 +1700,9 @@ nc_destroy(void)
     nc_ssh_destroy();
 #elif defined (NC_ENABLED_TLS)
     nc_tls_destroy();
+#endif
+
+#ifdef NC_ENABLED_FCGI
+    (void) nc_fcgi_destroy();
 #endif
 }

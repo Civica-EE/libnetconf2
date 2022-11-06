@@ -17,6 +17,7 @@
 
 @SSH_MACRO@
 @TLS_MACRO@
+@FCGI_MACRO@
 
 #ifdef __cplusplus
 extern "C" {

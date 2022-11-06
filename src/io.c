@@ -34,6 +34,7 @@
 
 #include "compat.h"
 #include "libnetconf.h"
+#include "session_p.h"
 
 const char *nc_msgtype2str[] = {
     "error",
@@ -202,6 +203,14 @@ nc_read(struct nc_session *session, char *buf, size_t count, uint32_t inact_time
                 }
             }
             break;
+#endif
+#ifdef NC_ENABLED_FCGI
+        case NC_TI_FCGI:
+            // Should never get here
+            ERR(session, "Internal error");
+            session->status = NC_STATUS_INVALID;
+            session->term_reason = NC_SESSION_TERM_OTHER;
+            return -1;
 #endif
         }
 
@@ -621,6 +630,11 @@ nc_session_is_connected(struct nc_session *session)
         fds.fd = SSL_get_fd(session->ti.tls);
         break;
 #endif
+#ifdef NC_ENABLED_FCGI
+    case NC_TI_FCGI:
+        return 1;
+        break;
+#endif
     default:
         return 0;
     }
@@ -660,6 +674,10 @@ nc_write(struct nc_session *session, const void *buf, size_t count)
 
 #ifdef NC_ENABLED_TLS
     unsigned long e;
+#endif
+
+#ifdef NC_ENABLED_FCGI
+    FCGX_Request *request;
 #endif
 
     if ((session->status != NC_STATUS_RUNNING) && (session->status != NC_STATUS_STARTING)) {
@@ -742,6 +760,16 @@ nc_write(struct nc_session *session, const void *buf, size_t count)
             }
             break;
 #endif
+#ifdef NC_ENABLED_FCGI
+        case NC_TI_FCGI:
+            request = &session->ti.fcgi.request;
+            c = FCGX_PutStr((char *)(buf + written), count - written, request->out);
+            if (c < 0) {
+                ERR(session, "socket error (%s).", strerror(errno));
+                return -1;
+            }
+            break;
+#endif
         default:
             ERRINT;
             return -1;
@@ -764,6 +792,12 @@ nc_write_starttag_and_msg(struct nc_session *session, const void *buf, size_t co
     int ret = 0, c;
     char chunksize[24];
 
+#ifdef NC_ENABLED_FCGI
+    if (session->ti_type == NC_TI_FCGI)
+    {
+    }
+    else
+#endif
     // warning: ‘%zu’ directive writing between 4 and 20 bytes into a region of size 18 [-Wformat-overflow=]
     if (session->version == NC_VERSION_11) {
         sprintf(chunksize, "\n#%zu\n", count);
@@ -787,6 +821,19 @@ nc_write_endtag(struct nc_session *session)
 {
     int ret;
 
+#ifdef NC_ENABLED_FCGI
+    if (session->ti_type == NC_TI_FCGI)
+    {
+        FCGX_Request *request;
+        ret = nc_session_2_request(session, &request);
+        if (!ret)
+        {
+            FCGX_FPrintF(request->out, "\r\n");
+            FCGX_Finish_r(&session->ti.fcgi.request);
+        }
+    }
+    else
+#endif
     if (session->version == NC_VERSION_11) {
         ret = nc_write(session, "\n##\n", 4);
     } else {
@@ -925,7 +972,10 @@ nc_write_msg_io(struct nc_session *session, int io_timeout, int type, ...)
     const char **capabilities;
     uint32_t *sid = NULL, i, wd = 0;
     LY_ERR lyrc;
+    LYD_FORMAT output_format = LYD_XML;
 
+    _DBG(NULL, "Writing reply type %d", type);
+    
     assert(session);
 
     if ((session->status != NC_STATUS_RUNNING) && (session->status != NC_STATUS_STARTING)) {
@@ -935,6 +985,17 @@ nc_write_msg_io(struct nc_session *session, int io_timeout, int type, ...)
 
     arg.session = session;
     arg.len = 0;
+
+#ifdef NC_ENABLED_FCGI
+    if (session->ti_type == NC_TI_FCGI)
+    {
+        if (nc_fcgi_get_output_format(session, &output_format) < 0) {
+            ERR(session, "Invalid session.");
+            return NC_MSG_ERROR;
+        }
+    }
+#endif
+    
 
     /* SESSION IO LOCK */
     ret = nc_session_io_lock(session, io_timeout, __func__);
@@ -993,16 +1054,35 @@ nc_write_msg_io(struct nc_session *session, int io_timeout, int type, ...)
 
         if (!rpc_envp) {
             /* can be NULL if replying with a malformed-message error */
-            nc_write_clb((void *)&arg, "<rpc-reply xmlns=\"" NC_NS_BASE "\">", 18 + strlen(NC_NS_BASE) + 2, 0);
-
+#ifdef NC_ENABLED_FCGI
+            if (session->ti_type == NC_TI_FCGI) {
+                if (nc_fcgi_send_headers_error(session,
+                                               ((struct nc_server_reply_error *)reply)->err) < 0) {
+                    ret = NC_MSG_ERROR;
+                    goto cleanup;
+                }
+                //nc_fcgi_send_headers_ok(session);
+            }
+            else
+#endif
+            {
+                nc_write_clb((void *)&arg, "<rpc-reply xmlns=\"" NC_NS_BASE "\">", 18 + strlen(NC_NS_BASE) + 2, 0);
+            }
+            
             assert(reply->type == NC_RPL_ERROR);
-            if (lyd_print_clb(nc_write_xmlclb, (void *)&arg, ((struct nc_server_reply_error *)reply)->err, LYD_XML,
+            if (lyd_print_clb(nc_write_xmlclb, (void *)&arg, ((struct nc_server_reply_error *)reply)->err, output_format,
                     LYD_PRINT_SHRINK | LYD_PRINT_WITHSIBLINGS)) {
                 ret = NC_MSG_ERROR;
                 goto cleanup;
             }
 
-            nc_write_clb((void *)&arg, "</rpc-reply>", 12, 0);
+#ifdef NC_ENABLED_FCGI
+            if (session->ti_type != NC_TI_FCGI)
+#endif
+            {
+                nc_write_clb((void *)&arg, "</rpc-reply>", 12, 0);
+            }
+            
             break;
         }
 
@@ -1016,6 +1096,14 @@ nc_write_msg_io(struct nc_session *session, int io_timeout, int type, ...)
 
         switch (reply->type) {
         case NC_RPL_OK:
+#ifdef NC_ENABLED_FCGI
+            if (session->ti_type == NC_TI_FCGI) {
+                if (nc_fcgi_send_headers_ok(session) < 0) {
+                    ret = NC_MSG_ERROR;
+                    goto cleanup;
+                }
+            }
+#endif
             if (lyd_new_opaq2(reply_envp, NULL, "ok", NULL, rpc_envp->name.prefix, rpc_envp->name.module_ns, NULL)) {
                 lyd_free_tree(reply_envp);
 
@@ -1041,14 +1129,37 @@ nc_write_msg_io(struct nc_session *session, int io_timeout, int type, ...)
                 break;
             }
 
+#ifdef NC_ENABLED_FCGI
+            if (session->ti_type == NC_TI_FCGI) {
+                if (nc_fcgi_send_headers_data(session) < 0) {
+                    ret = NC_MSG_ERROR;
+                    goto cleanup;
+                }
+            }
+#endif
             node = ((struct nc_server_reply_data *)reply)->data;
+            DBG(NULL, "Reply data (%d) ^^^", lyd_print_file(stdout, node, LYD_XML, LYD_PRINT_WD_ALL | LYD_PRINT_KEEPEMPTYCONT));
+#ifndef NC_ENABLED_FCGI
+            // No longer holds when returning RPCs for RESTCONF, eg
+            // yang-library-version etc.
             assert(node->schema->nodetype & (LYS_RPC | LYS_ACTION));
+#endif
             LY_LIST_FOR_SAFE(lyd_child(node), next, node) {
                 /* temporary */
                 lyd_insert_child(reply_envp, node);
             }
             break;
         case NC_RPL_ERROR:
+#ifdef NC_ENABLED_FCGI
+            if (session->ti_type == NC_TI_FCGI) {
+                if (nc_fcgi_send_headers_error(session,
+                                               ((struct nc_server_reply_error *)reply)->err) < 0) {
+                    ret = NC_MSG_ERROR;
+                    goto cleanup;
+                }
+
+            }
+#endif
             /* temporary */
             lyd_insert_child(reply_envp, ((struct nc_server_reply_error *)reply)->err);
             break;
@@ -1063,7 +1174,15 @@ nc_write_msg_io(struct nc_session *session, int io_timeout, int type, ...)
         ((struct lyd_node_opaq *)reply_envp)->attr = rpc_envp->attr;
 
         /* print */
-        lyrc = lyd_print_clb(nc_write_xmlclb, (void *)&arg, reply_envp, LYD_XML, LYD_PRINT_SHRINK | wd);
+#ifdef NC_ENABLED_FCGI
+        if (session->ti_type == NC_TI_FCGI) {
+            lyrc = lyd_print_clb(nc_write_xmlclb, (void *)&arg, lyd_child(reply_envp), output_format, LYD_PRINT_WITHSIBLINGS | LYD_PRINT_SHRINK | LYD_PRINT_KEEPEMPTYCONT | wd);
+        } else
+#endif
+        {
+            lyrc = lyd_print_clb(nc_write_xmlclb, (void *)&arg, reply_envp, output_format, LYD_PRINT_SHRINK | wd);
+        }
+
         ((struct lyd_node_opaq *)reply_envp)->attr = NULL;
 
         /* cleanup */

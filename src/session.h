@@ -74,7 +74,10 @@ typedef enum {
     NC_TI_LIBSSH,     /**< libssh - use libssh library, only for NETCONF over SSH transport */
 #endif
 #ifdef NC_ENABLED_TLS
-    NC_TI_OPENSSL     /**< OpenSSL - use OpenSSL library, only for NETCONF over TLS transport */
+    NC_TI_OPENSSL,     /**< OpenSSL - use OpenSSL library, only for NETCONF over TLS transport */
+#endif
+#ifdef NC_ENABLED_FCGI
+    NC_TI_FCGI,
 #endif
 } NC_TRANSPORT_IMPL;
 

@@ -509,6 +509,15 @@ nc_sock_accept_binds(struct nc_bind *binds, uint16_t bind_count, int timeout, ch
         return -1;
     }
 
+    if (server_opts.endpts[i].ti == NC_TI_FCGI)
+    {
+        if (idx) *idx = i;
+        if (host) *host = NULL;
+        if (port) *port = -1;
+
+        return sock;
+    }
+    
     /* accept connection */
     client_sock = accept(sock, (struct sockaddr *)&saddr, &saddr_len);
     if (client_sock < 0) {
@@ -1607,6 +1616,11 @@ nc_ps_poll_session_io(struct nc_session *session, int io_timeout, time_t now_mon
             ret = NC_PSPOLL_TIMEOUT;
         }
         break;
+#ifdef NC_ENABLED_FCGI
+    case NC_TI_FCGI:
+        ret = NC_PSPOLL_RPC;
+        break;
+#endif
     case NC_TI_NONE:
         sprintf(msg, "internal error (%s:%d)", __FILE__, __LINE__);
         ret = NC_PSPOLL_ERROR;
@@ -1774,7 +1788,14 @@ nc_ps_poll(struct nc_pollsession *ps, int timeout, struct nc_session **session)
 
     /* we have some data available and the session is RPC locked (but not IO locked) */
     if (ret == NC_PSPOLL_RPC) {
-        ret = nc_server_recv_rpc_io(cur_session, timeout, &rpc);
+#ifdef NC_ENABLED_FCGI
+        if (cur_session->ti_type == NC_TI_FCGI) {
+            ret = nc_server_recv_rpc_fcgi(cur_session, timeout, &rpc);
+        } else
+#endif
+        {
+            ret = nc_server_recv_rpc_io(cur_session, timeout, &rpc);
+        }
         if (ret & (NC_PSPOLL_ERROR | NC_PSPOLL_BAD_RPC)) {
             if (cur_session->status != NC_STATUS_RUNNING) {
                 ret |= NC_PSPOLL_SESSION_TERM | NC_PSPOLL_SESSION_ERROR;
@@ -1799,6 +1820,12 @@ nc_ps_poll(struct nc_pollsession *ps, int timeout, struct nc_session **session)
         }
         nc_server_rpc_free(rpc);
 
+#ifdef NC_ENABLED_FCGI
+        if (cur_session->ti_type == NC_TI_FCGI) {
+            cur_session->status = NC_PSPOLL_SESSION_TERM;
+        }
+#endif
+        
         /* SESSION RPC UNLOCK */
         nc_session_rpc_unlock(cur_session, NC_SESSION_LOCK_TIMEOUT, __func__);
     }
@@ -1999,6 +2026,21 @@ nc_server_add_endpt(const char *name, NC_TRANSPORT_IMPL ti)
         server_opts.endpts[server_opts.endpt_count - 1].opts.unixsock->uid = (uid_t)-1;
         server_opts.endpts[server_opts.endpt_count - 1].opts.unixsock->gid = (gid_t)-1;
         break;
+#ifdef NC_ENABLED_FCGI
+    case NC_TI_FCGI:
+        server_opts.endpts[server_opts.endpt_count - 1].opts.fcgi = calloc(1, sizeof(struct nc_server_fcgi_opts));
+        if (!server_opts.endpts[server_opts.endpt_count - 1].opts.fcgi) {
+            ERRMEM;
+            ret = -1;
+            goto cleanup;
+        }
+        server_opts.endpts[server_opts.endpt_count - 1].opts.fcgi->backlog = NC_REVERSE_QUEUE;
+        server_opts.endpts[server_opts.endpt_count - 1].opts.fcgi->mode = (mode_t)-1;
+        server_opts.endpts[server_opts.endpt_count - 1].opts.fcgi->uid = (uid_t)-1;
+        server_opts.endpts[server_opts.endpt_count - 1].opts.fcgi->gid = (gid_t)-1;
+        
+        break;
+#endif
     default:
         ERRINT;
         ret = -1;
@@ -2047,6 +2089,11 @@ nc_server_del_endpt(const char *name, NC_TRANSPORT_IMPL ti)
             case NC_TI_UNIX:
                 free(server_opts.endpts[i].opts.unixsock);
                 break;
+#ifdef NC_ENABLED_FCGI
+            case NC_TI_FCGI:
+                free(server_opts.endpts[i].opts.fcgi);
+                break;
+#endif
             default:
                 ERRINT;
                 /* won't get here ...*/
@@ -2091,6 +2138,11 @@ nc_server_del_endpt(const char *name, NC_TRANSPORT_IMPL ti)
                 case NC_TI_UNIX:
                     free(server_opts.endpts[i].opts.unixsock);
                     break;
+#ifdef NC_ENABLED_FCGI
+                case NC_TI_FCGI:
+                    free(server_opts.endpts[i].opts.fcgi);
+                    break;
+#endif
                 default:
                     ERRINT;
                     break;
@@ -2205,17 +2257,25 @@ nc_server_endpt_set_address_port(const char *endpt_name, const char *address, ui
         address = bind->address;
     }
 
-    if (!set_addr && (endpt->ti == NC_TI_UNIX)) {
+    if (!set_addr && (endpt->ti == NC_TI_UNIX ||
+                      endpt->ti == NC_TI_FCGI)) {
         ret = -1;
         goto cleanup;
     }
 
     /* we have all the information we need to create a listening socket */
-    if (address && (port || (endpt->ti == NC_TI_UNIX))) {
+    if (address && (port || (endpt->ti == NC_TI_UNIX ||
+                             endpt->ti == NC_TI_FCGI))) {
         /* create new socket, close the old one */
         if (endpt->ti == NC_TI_UNIX) {
             sock = nc_sock_listen_unix(address, endpt->opts.unixsock);
-        } else {
+        }
+#ifdef NC_ENABLED_FCGI
+        else if (endpt->ti == NC_TI_FCGI) {
+            sock = nc_sock_listen_fcgi(address, endpt->opts.fcgi);
+        }
+#endif
+        else {
             sock = nc_sock_listen_inet(address, port, &endpt->ka);
         }
         if (sock == -1) {
@@ -2249,6 +2309,11 @@ nc_server_endpt_set_address_port(const char *endpt_name, const char *address, ui
 #ifdef NC_ENABLED_TLS
         case NC_TI_OPENSSL:
             VRB(NULL, "Listening on %s:%u for TLS connections.", address, port);
+            break;
+#endif
+#ifdef NC_ENABLED_FCGI
+        case NC_TI_FCGI:
+            VRB(NULL, "Listening on %s for FCGI connections.", address);
             break;
 #endif
         default:
@@ -2304,14 +2369,23 @@ nc_server_endpt_set_perms(const char *endpt_name, mode_t mode, uid_t uid, gid_t 
         return -1;
     }
 
-    if (endpt->ti != NC_TI_UNIX) {
+    switch (endpt->ti)
+    {
+    case NC_TI_UNIX:
+        endpt->opts.unixsock->mode = mode;
+        endpt->opts.unixsock->uid = uid;
+        endpt->opts.unixsock->gid = gid;
+        break;
+    case NC_TI_FCGI:
+        endpt->opts.fcgi->mode = mode;
+        endpt->opts.fcgi->uid = uid;
+        endpt->opts.fcgi->gid = gid;
+        break;
+    default:
         ret = -1;
         goto cleanup;
     }
 
-    endpt->opts.unixsock->mode = mode;
-    endpt->opts.unixsock->uid = uid;
-    endpt->opts.unixsock->gid = gid;
 
 cleanup:
     /* ENDPT UNLOCK */
@@ -2416,19 +2490,16 @@ nc_accept(int timeout, struct nc_session **session)
         return NC_MSG_ERROR;
     }
 
-    /* switch bind_lock for endpt_lock, so that another thread can accept another session */
     /* ENDPT READ LOCK */
     pthread_rwlock_rdlock(&server_opts.endpt_lock);
-
-    /* BIND UNLOCK */
-    pthread_mutex_unlock(&server_opts.bind_lock);
 
     sock = ret;
 
     *session = nc_new_session(NC_SERVER, 0);
     if (!(*session)) {
         ERRMEM;
-        close(sock);
+        if (sock != server_opts.binds[bind_idx].sock)
+            close(sock);
         free(host);
         msgtype = NC_MSG_ERROR;
         goto cleanup;
@@ -2436,8 +2507,11 @@ nc_accept(int timeout, struct nc_session **session)
     (*session)->status = NC_STATUS_STARTING;
     (*session)->ctx = server_opts.ctx;
     (*session)->flags = NC_SESSION_SHAREDCTX;
-    lydict_insert_zc(server_opts.ctx, host, &(*session)->host);
-    (*session)->port = port;
+    if (host)
+    {
+        lydict_insert_zc(server_opts.ctx, host, &(*session)->host);
+        (*session)->port = port;
+    }
 
     /* sock gets assigned to session or closed */
 #ifdef NC_ENABLED_SSH
@@ -2473,7 +2547,20 @@ nc_accept(int timeout, struct nc_session **session)
             msgtype = NC_MSG_ERROR;
             goto cleanup;
         }
-    } else {
+    } else 
+#ifdef NC_ENABLED_FCGI
+    if (server_opts.endpts[bind_idx].ti == NC_TI_FCGI) {
+        // Note - for FCGI nc_sock_accept_binds returns the server socket -
+        // unlike the other nc_accept_x, nc_accept_fcgi does perform the
+        // actual accept syscall.
+        ret = nc_accept_fcgi(*session, sock);
+        if (ret < 0) {
+            msgtype = NC_MSG_ERROR;
+            goto cleanup;
+        }
+    } else 
+#endif
+    {
         ERRINT;
         close(sock);
         msgtype = NC_MSG_ERROR;
@@ -2485,15 +2572,28 @@ nc_accept(int timeout, struct nc_session **session)
     /* ENDPT UNLOCK */
     pthread_rwlock_unlock(&server_opts.endpt_lock);
 
+    /* BIND UNLOCK */
+    pthread_mutex_unlock(&server_opts.bind_lock);
+
+    
     /* assign new SID atomically */
     (*session)->id = ATOMIC_INC_RELAXED(server_opts.new_session_id);
 
     /* NETCONF handshake */
-    msgtype = nc_handshake_io(*session);
-    if (msgtype != NC_MSG_HELLO) {
-        nc_session_free(*session, NULL);
-        *session = NULL;
-        return msgtype;
+#ifdef NC_ENABLED_FCGI
+    if ((*session)->ti_type == NC_TI_FCGI)
+    {
+        msgtype = NC_MSG_HELLO;
+    }
+    else
+#endif
+    {
+        msgtype = nc_handshake_io(*session);
+        if (msgtype != NC_MSG_HELLO) {
+            nc_session_free(*session, NULL);
+            *session = NULL;
+            return msgtype;
+        }
     }
 
     nc_gettimespec_mono(&ts_cur);
@@ -2508,6 +2608,10 @@ cleanup:
     /* ENDPT UNLOCK */
     pthread_rwlock_unlock(&server_opts.endpt_lock);
 
+    /* BIND UNLOCK */
+    pthread_mutex_unlock(&server_opts.bind_lock);
+
+    
     nc_session_free(*session, NULL);
     *session = NULL;
     return msgtype;

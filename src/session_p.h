@@ -123,6 +123,10 @@ struct nc_server_tls_opts {
 
 #endif /* NC_ENABLED_TLS */
 
+#ifdef NC_ENABLED_FCGI
+#include <fcgiapp.h>
+#endif
+
 /* ACCESS unlocked */
 struct nc_keepalives {
     int enabled;
@@ -133,6 +137,14 @@ struct nc_keepalives {
 
 /* ACCESS unlocked */
 struct nc_server_unix_opts {
+    mode_t mode;
+    uid_t uid;
+    gid_t gid;
+};
+
+/* ACCESS unlocked */
+struct nc_server_fcgi_opts {
+    int backlog;
     mode_t mode;
     uid_t uid;
     gid_t gid;
@@ -251,6 +263,9 @@ struct nc_server_opts {
             struct nc_server_tls_opts *tls;
 #endif
             struct nc_server_unix_opts *unixsock;
+#ifdef NC_ENABLED_FCGI
+            struct nc_server_fcgi_opts *fcgi;
+#endif
         } opts;
     } *endpts;
     uint16_t endpt_count;
@@ -387,6 +402,7 @@ struct nc_msg_cont {
 /**
  * @brief NETCONF session structure
  */
+
 struct nc_session {
     NC_STATUS status;            /**< status of the session */
     NC_SESSION_TERM_REASON term_reason; /**< reason of termination, if status is NC_STATUS_INVALID */
@@ -421,6 +437,11 @@ struct nc_session {
 #endif
 #ifdef NC_ENABLED_TLS
         SSL *tls;
+#endif
+#ifdef NC_ENABLED_FCGI
+        struct {
+            FCGX_Request request;
+        } fcgi;
 #endif
     } ti;                          /**< transport implementation data */
     const char *username;
@@ -646,6 +667,7 @@ int nc_sock_listen_inet(const char *address, uint16_t port, struct nc_keepalives
  */
 int nc_sock_listen_unix(const char *address, const struct nc_server_unix_opts *opts);
 
+
 /**
  * @brief Accept a new connection on a listening socket.
  *
@@ -857,5 +879,82 @@ NC_MSG_TYPE nc_write_msg_io(struct nc_session *session, int io_timeout, int type
  * @return 1 if connected, 0 if not.
  */
 int nc_session_is_connected(struct nc_session *session);
+
+#ifdef NC_ENABLED_FCGI
+
+/**
+ * @brief Shuts down libfcgi.
+ */
+int nc_fcgi_destroy(void);
+
+/**
+ * @brief Initializes libfcgi.
+ */
+int nc_fcgi_init(void);
+
+/**
+ * @brief Creates a listening FCGI socket.
+ *
+ * @param[in] address UNIX address to listen on.
+ * @param[in] opts The FCGI options.
+ * @return Listening socket, -1 on error.
+ */
+int nc_sock_listen_fcgi(const char *address, const struct nc_server_fcgi_opts *opts);
+
+/**
+ * @brief Performs an FCGI accept and returns a new session (blocking).
+ */
+int
+nc_accept_fcgi(struct nc_session *session, int sock);
+
+/**
+ * Returns a pointer to the request member of *session (with validation etc).
+ */
+int
+nc_session_2_request (struct nc_session *session, FCGX_Request **request);
+
+
+/**
+ * @brief Returns the RPC corresponding to a RESTCONF request.
+ *
+ * @param[in] session A session using FCGI transport.
+ * @param[out] rpp The RPC, if the request can be mapped to one
+ * @return 0 on success, !0 if the session or the HTTP request cannot be
+ * mapped to an RPC.
+ */
+int
+nc_server_recv_rpc_fcgi(struct nc_session *session, int io_timeout, struct nc_server_rpc **rpc);
+
+/**
+ * Returns the output format for an FCGI session into output_format.
+ */
+int
+nc_fcgi_get_output_format (struct nc_session *session, LYD_FORMAT *output_format);
+
+/**
+ * Returns the output format for an FCGI session into input_format.
+ */
+int
+nc_fcgi_get_input_format (struct nc_session *session, LYD_FORMAT *input_format);
+
+/**
+ * Sets reply headers for HTTP 201 CREATED response.
+ */
+int
+nc_fcgi_send_headers_ok (struct nc_session *session);
+
+/**
+ * Sets reply headers for HTTP 200 OK response.
+ */
+int
+nc_fcgi_send_headers_data (struct nc_session *session);
+
+/**
+ * Sets reply headers for HTTP 4xx response.
+ */
+int
+nc_fcgi_send_headers_error(struct nc_session *session, struct lyd_node *err);
+
+#endif
 
 #endif /* NC_SESSION_PRIVATE_H_ */
