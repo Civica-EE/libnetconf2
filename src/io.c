@@ -864,6 +864,8 @@ nc_write_clb(void *arg, const void *buf, size_t count, int xmlcontent)
     size_t l;
     struct wclb_arg *warg = (struct wclb_arg *)arg;
 
+    _DBG(NULL, "Writing '%.*s'", count, buf);
+    
     if (!buf) {
         c = nc_write_clb_flush(warg);
         if (c == -1) {

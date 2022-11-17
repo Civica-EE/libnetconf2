@@ -30,6 +30,14 @@
         }                                       \
     } while (0)
 
+#define BAIL_IF(EXP, LBL) do {                  \
+        if (EXP) {                              \
+            DBG(NULL, "Err");                   \
+            goto LBL;                           \
+        }                                       \
+    } while (0)
+
+
 // Defined in session_server.c
 extern struct nc_server_opts server_opts;
 
@@ -216,6 +224,75 @@ nc_fcgi_uri_next (char **uri)
 }
 
 
+// transforms a/b/c=d/f/g=h,i => /a/b/c[kd=d]/f/g[kh=h,ki=i]
+static char*
+nc_fcgi_uri2xpath (char *uri)
+{
+    char *xpath = NULL;
+    char *keys_dup = NULL;
+    char *next;
+
+    // next is either 'foo' or 'foo=bar' or 'foo=bar,baz'
+    while ((next = strtok_r(uri, "/", &uri)) != NULL) 
+    {
+        char *keys, *kv, *key, *tmp, ksep;
+        char *container = strtok_r(next, "=", &next);
+        
+        BAIL_IF(asprintf(&tmp, "%s/%s",
+                         xpath ? xpath : "", nc_fcgi_percent_decode(container)) < 0,
+                bail);
+        
+        if (xpath) free(xpath);
+        xpath = tmp;
+
+        ksep = '[';
+        
+        while ((kv = strtok_r(next, ",", &next)) != NULL) {
+            if (ksep == '[') {
+                const struct lysc_node *node = lys_find_path(server_opts.ctx, NULL, xpath, 0);
+                BAIL_IF(node == NULL, bail);
+                
+                if (node->nodetype & LYS_LIST) {
+                    node = lys_find_child(node, node->module, "key", 0, LYS_LEAF, 0);
+                    BAIL_IF(node == NULL, bail);
+                
+                    keys = keys_dup = strdup(((struct lysc_node_leaf*) node)->ref);
+                    DBG(NULL, "Keys: %s", keys);
+                    key = strtok_r(keys, ",", &keys);
+                } else if (node->nodetype & LYS_LEAFLIST) {
+                    keys = keys_dup = NULL;
+                    key = NULL;
+                } else {
+                    BAIL_IF(1, bail);
+                }
+            }
+            
+            BAIL_IF(asprintf(&tmp, "%s%c%s%s%s%s", xpath, ksep, key, key ? "=" : "",
+                             nc_fcgi_percent_decode(kv), keys && *keys ? "" : "]") < 0,
+                    bail);
+            free(xpath);
+            xpath = tmp;
+            
+            ksep = ',';
+            if (keys)
+                key = strtok_r(keys, ",", &keys);
+        }
+
+        if (keys_dup) {
+            free(keys_dup);
+            keys_dup = NULL;
+        }
+    }
+    
+    return xpath;
+
+ bail:
+    if (xpath) free(xpath);
+    if (keys_dup) free(keys_dup);
+    return NULL;
+}
+
+
 static struct nc_server_reply*
 nc_fcgi_err_reply (NC_ERR error, NC_ERR_TYPE error_type, char *format, ...)
 {
@@ -244,7 +321,9 @@ nc_fcgi_get_rq_output_format (FCGX_Request *request)
     char *media_accept = NULL;
 
     media_accept = FCGX_GetParam("HTTP_ACCEPT", request->envp);
-    if (media_accept && strcmp(media_accept, "application/yang-data+xml") == 0)
+    // Mozilla sends "application/yang-data+xml, */*; q=0.01"  - don't just
+    // strcmp it.
+    if (media_accept && strcasestr(media_accept, "application/yang-data+xml") != NULL)
         return LYD_XML;
     
     return LYD_JSON; // Default
@@ -623,6 +702,7 @@ nc_fcgi_restconf_rpc (struct nc_session *session, struct nc_server_rpc **rpc)
     if (ret && *rpc)
     {
         free(*rpc);
+        *rpc = NULL;
     }
     
     return ret;
@@ -633,13 +713,13 @@ nc_fcgi_restconf_rpc (struct nc_session *session, struct nc_server_rpc **rpc)
  * 'ietf-netconf:get'.
  */
 static int
-nc_fcgi_uri_data_rpc (struct nc_session *session, struct nc_server_rpc **rpc)
+nc_fcgi_uri_data_rpc (struct nc_session *session, char *uri_rem, struct nc_server_rpc **rpc)
 {
     int ret = 0;
     const struct lys_module *mod = NULL;
     (void) session;
     
-    DBG(NULL, "URI: /restconf/data");
+    DBG(NULL, "URI: /restconf/data node '%s'", uri_rem);
     ERR(NULL, "XXX");
     if ((mod = ly_ctx_get_module_implemented(server_opts.ctx, "ietf-netconf")) == NULL) {
         BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
@@ -654,6 +734,32 @@ nc_fcgi_uri_data_rpc (struct nc_session *session, struct nc_server_rpc **rpc)
     if (lyd_new_inner(NULL, mod, "get", 0, &(*rpc)->rpc)) {
         BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
     }
+
+    if (strlen(uri_rem)) {
+        struct lyd_node *filter = NULL;;
+        char *xpath = NULL;
+
+        if ((xpath = nc_fcgi_uri2xpath(uri_rem)) == NULL) {
+            BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
+        }
+        DBG(NULL, "Filter xpath: '%s'", xpath);
+        
+        if (lyd_new_any((*rpc)->rpc, mod, "filter", "", 1, LYD_ANYDATA_STRING, 0, &filter)) {
+            BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup2);
+        }
+        if (lyd_new_meta(NULL, filter, NULL, "ietf-netconf:type", "xpath", 0, NULL)) {
+            BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup2);
+        }
+        if (lyd_new_meta(NULL, filter, NULL, "ietf-netconf:select", xpath, 0, NULL)) {
+            BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup2);
+        }
+
+    cleanup2:
+        if (xpath) free(xpath);
+        if (ret) {
+            goto cleanup;
+        }
+    }
     
     if (lyd_new_opaq2(NULL, server_opts.ctx, "rpc", NULL, mod->prefix, mod->ns, &(*rpc)->envp)) {
         BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
@@ -663,6 +769,7 @@ nc_fcgi_uri_data_rpc (struct nc_session *session, struct nc_server_rpc **rpc)
     if (ret && *rpc)
     {
         free(*rpc);
+        *rpc = NULL;
     }
     
     return ret;
@@ -680,6 +787,7 @@ nc_fcgi_uri_ds_rpc (struct nc_session *session, char *uri_rem, struct nc_server_
     int ret = 0;
     const struct lys_module *mod = NULL;
     char *datastore = nc_fcgi_uri_next(&uri_rem);
+    char *xpath = NULL;
 
     (void) session;
 
@@ -707,6 +815,17 @@ nc_fcgi_uri_ds_rpc (struct nc_session *session, char *uri_rem, struct nc_server_
     if (lyd_new_term((*rpc)->rpc, NULL, "datastore", datastore, 0, NULL)) {
         BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
     }
+
+    if (strlen(uri_rem)) {
+        if ((xpath = nc_fcgi_uri2xpath(uri_rem)) == NULL) {
+            BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
+        }
+        DBG(NULL, "Filter xpath: '%s'", xpath);
+        
+        if (lyd_new_term((*rpc)->rpc, mod, "xpath-filter", xpath, 0, NULL)) {
+            BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
+        }
+    }
     
     if (lyd_new_opaq2(NULL, server_opts.ctx, "rpc", NULL, mod->prefix, mod->ns, &(*rpc)->envp)) {
         BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
@@ -716,6 +835,7 @@ nc_fcgi_uri_ds_rpc (struct nc_session *session, char *uri_rem, struct nc_server_
     if (ret && *rpc)
     {
         free(*rpc);
+        *rpc = NULL;
     }
     
     return ret;
@@ -867,7 +987,7 @@ nc_fcgi_uri_operations_post_rpc (struct nc_session *session,
         BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
     }
 
-    _DBG(NULL, "RPC data:\n>%s<\n", rpc_data);
+    DBG(NULL, "RPC data:\n>%s<\n", rpc_data);
     
     if (ly_in_new_memory(rpc_data, &ly_in)) {
         BAIL_OUT(NC_PSPOLL_REPLY_ERROR, cleanup);
@@ -887,6 +1007,7 @@ nc_fcgi_uri_operations_post_rpc (struct nc_session *session,
     if (ret && *rpc)
     {
         free(*rpc);
+        *rpc = NULL;
     }
     
     return ret;
@@ -941,7 +1062,7 @@ nc_fcgi_uri_restconf_rpc (struct nc_session *session, char *uri_rem, struct nc_s
     if (!resource) {
         ret = nc_fcgi_restconf_rpc(session, rpc);
     } else if (strcmp(resource, "data") == 0) {
-        ret = nc_fcgi_uri_data_rpc(session, rpc);
+        ret = nc_fcgi_uri_data_rpc(session, uri_rem, rpc);
     } else if (strcmp(resource, "ds") == 0) {
         ret = nc_fcgi_uri_ds_rpc(session, uri_rem, rpc);
     } else if (strcmp(resource, "operations") == 0) {
@@ -1206,7 +1327,7 @@ nc_fcgi_get_input_format (struct nc_session *session, LYD_FORMAT *input_format)
         media_content_type = FCGX_GetParam("CONTENT_TYPE", request->envp);
 
     DBG(NULL, "Content type: %s", media_content_type);
-    if (media_content_type && strcmp(media_content_type, "application/yang-data+xml")==0)
+    if (media_content_type && strcasecmp(media_content_type, "application/yang-data+xml")==0)
         *input_format = LYD_XML;
     
     return 0;

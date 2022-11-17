@@ -646,6 +646,7 @@ nc_clb_default_get_schema(struct lyd_node *rpc, struct nc_session *session)
     } else {
         lys_print_submodule(out, submodule, outformat, 0, 0);
     }
+    DBG(NULL, "Model data:\n>%s<\n", model_data);
     ly_out_free(out, NULL, 0);
     if (!model_data) {
         ERRINT;
